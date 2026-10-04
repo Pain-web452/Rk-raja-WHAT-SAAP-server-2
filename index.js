@@ -517,7 +517,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>9AMAN X YAMDHUD — Control Center</title>
+<title>◄⸻̅͟ˣ͠𓆩𝐑꯭꘍꯭֟፝͡᪂꘍꯭ 𝐋꯭𖾝ԍ𖾝꯭֟፝͡᎔꯭𑀘𓆪꯭ˣ͢— Control Center</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   html,body{height:100%}
