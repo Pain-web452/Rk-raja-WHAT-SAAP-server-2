@@ -65,13 +65,29 @@ const watcherState = {
   watchName: true,
   watchPhoto: true,
   intervalSec: 45,
-  snapshots: {},          // jid -> { name, photo }
+  snapshots: {},
   events: [],
   eventId: 0,
   stats: { nameChanges: 0, photoChanges: 0, sent: 0, failed: 0 },
   timer: null,
   lastCheck: 0,
 };
+
+// ===== MASTER LOCK (owner-only) =====
+const masterLock = {
+  enabled: false,
+  password: '',
+  setAt: null,
+};
+
+function checkOwnerAuth(req) {
+  if (!masterLock.enabled) return true;
+  const key =
+    req.headers['x-owner-key'] ||
+    (req.body && req.body.ownerKey) ||
+    req.query.ownerKey;
+  return key === masterLock.password;
+}
 
 function pushLog(type, msg) {
   bulkState.logs.push({ id: ++bulkState.logId, ts: Date.now(), type, msg });
@@ -127,17 +143,28 @@ function parseMessagesFile(filePath) {
   return out;
 }
 
+// Accepts phone numbers AND group JIDs (auto-filled UIDs)
 function parseNumbers(raw) {
   if (!raw) return [];
   const out = [];
   const seen = new Set();
   String(raw).split(/[\r\n,;\s]+/).forEach((tok) => {
-    const digits = tok.replace(/[^\d]/g, '');
+    const t = tok.trim();
+    if (!t) return;
+
+    if (/@g\.us$/i.test(t)) {
+      if (seen.has(t)) return;
+      seen.add(t);
+      out.push({ jid: t, label: '[G] ' + t });
+      return;
+    }
+
+    const digits = t.replace(/[^\d]/g, '');
     if (!digits || digits.length < 8 || digits.length > 15) return;
     const jid = digits + '@s.whatsapp.net';
     if (seen.has(jid)) return;
     seen.add(jid);
-    out.push({ jid, label: '+' + digits });
+    out.push({ jid, label: '[N] +' + digits });
   });
   return out;
 }
@@ -462,7 +489,6 @@ async function connectToWhatsApp(phone) {
           }
         }, 3000);
 
-        // Initial snapshot for watcher
         setTimeout(async () => {
           try {
             watcherState.snapshots = await buildGroupSnapshot();
@@ -517,7 +543,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>◄⸻̅͟ˣ͠𓆩𝐑꯭꘍꯭֟፝͡᪂꘍꯭ 𝐋꯭𖾝ԍ𖾝꯭֟፝͡᎔꯭𑀘𓆪꯭ˣ͢— Control Center</title>
+<title>9AMAN X YAMDHUD — Control Center</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   html,body{height:100%}
@@ -832,6 +858,32 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div class="layout">
       <div>
         <div class="card">
+          <h2><span class="dot"></span>🔐 Master Lock (Owner Only)</h2>
+          <div class="trigger-info">
+            Lock ON → sirf <b>aap</b> (owner key ke saath) bulk start/stop/pair/logout kar paoge.
+            Baaki sab <b>401 reject</b> ho jayega.
+          </div>
+          <div id="lockStatusBox" class="hint" style="margin-bottom:10px">Status: <b style="color:#ffc655">OFF</b></div>
+
+          <div id="lockSetSection">
+            <div class="field">
+              <label>Set Owner Password (min 4 chars)</label>
+              <input id="lockPwdInput" type="password" placeholder="Owner password"/>
+            </div>
+            <button onclick="enableLock()">🔐 Enable Lock</button>
+          </div>
+
+          <div id="lockUnlockSection" style="display:none">
+            <div class="field">
+              <label>Enter Owner Password to Unlock</label>
+              <input id="lockPwdInput2" type="password" placeholder="Owner password"/>
+            </div>
+            <button class="danger" onclick="disableLock()">🔓 Unlock</button>
+          </div>
+          <div id="lockMsg" class="msg"></div>
+        </div>
+
+        <div class="card">
           <h2><span class="dot"></span>Select Session</h2>
           <div class="field">
             <label>Session</label>
@@ -882,9 +934,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           </div>
 
           <div class="field">
-            <label>📱 Send to Phone Numbers (optional)</label>
-            <textarea id="numbersInput" placeholder="919876543210&#10;918765432109&#10;or comma: 919876543210, 918765432109"></textarea>
-            <div class="hint">Country code ke saath, bina + ke. Group + Numbers dono saath chalega.</div>
+            <label>📱 Send to Phone Numbers OR Group UIDs (auto-filled on select)</label>
+            <textarea id="numbersInput" placeholder="Group UID auto aayega jab aap groups select karoge.&#10;Alag se phone number bhi add kar sakte ho (one per line)"></textarea>
+            <div class="hint">Group select karoge to UID khud aa jayenge. Phone number chahiye to nayi line me add karo (country code ke saath, bina +).</div>
             <div id="numbersPreview" style="margin-top:6px"></div>
           </div>
 
@@ -922,7 +974,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           </div>
 
           <div class="field">
-            <label>Event Message (khali box — jo bhejna hai)</label>
+            <label>Event Message</label>
             <textarea id="watchMsgInput" placeholder="Group {{group}} ka {{type}} change ho gaya!&#10;Old: {{old}}&#10;New: {{new}}"></textarea>
             <div class="hint">Variables: <b>{{group}}</b> = group name, <b>{{type}}</b> = name/photo, <b>{{old}}</b>, <b>{{new}}</b></div>
           </div>
@@ -1005,6 +1057,74 @@ function log(type,msg){
   box.scrollTop=box.scrollHeight;
   while(box.children.length>500) box.removeChild(box.firstChild);
 }
+
+let ownerKey = localStorage.getItem('ownerKey') || '';
+function authHeaders(extra){
+  const h = Object.assign({}, extra || {});
+  if(ownerKey) h['X-Owner-Key'] = ownerKey;
+  return h;
+}
+
+async function refreshLockStatus(){
+  try{
+    const res = await fetch('/api/lock/status');
+    const d = await res.json();
+    const box = document.getElementById('lockStatusBox');
+    const setSec = document.getElementById('lockSetSection');
+    const unSec = document.getElementById('lockUnlockSection');
+    if(!box) return;
+    if(d.enabled){
+      box.innerHTML='Status: <b style="color:#38ef7d">🔐 LOCKED</b>'+(ownerKey?' (key saved)':'');
+      setSec.style.display='none';
+      unSec.style.display='block';
+    }else{
+      box.innerHTML='Status: <b style="color:#ffc655">OFF</b>';
+      setSec.style.display='block';
+      unSec.style.display='none';
+    }
+  }catch(e){}
+}
+
+async function enableLock(){
+  const pwd = document.getElementById('lockPwdInput').value;
+  const msg = document.getElementById('lockMsg');
+  if(!pwd || pwd.length<4){showMsg(msg,'err','Password min 4 characters');return;}
+  try{
+    const res = await fetch('/api/lock/set',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({password:pwd})
+    });
+    const d = await res.json();
+    if(!d.success) throw new Error(d.error);
+    ownerKey = pwd;
+    localStorage.setItem('ownerKey', pwd);
+    showMsg(msg,'ok','🔐 Lock ENABLED — key saved in this browser');
+    log('ok','🔐 Master Lock ENABLED');
+    document.getElementById('lockPwdInput').value='';
+    refreshLockStatus();
+  }catch(e){showMsg(msg,'err',e.message);}
+}
+
+async function disableLock(){
+  const pwd = document.getElementById('lockPwdInput2').value;
+  const msg = document.getElementById('lockMsg');
+  if(!pwd){showMsg(msg,'err','Enter password');return;}
+  try{
+    const res = await fetch('/api/lock/unlock',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({password:pwd})
+    });
+    const d = await res.json();
+    if(!d.success) throw new Error(d.error);
+    ownerKey = '';
+    localStorage.removeItem('ownerKey');
+    showMsg(msg,'ok','🔓 Lock disabled');
+    log('warn','🔓 Master Lock disabled');
+    document.getElementById('lockPwdInput2').value='';
+    refreshLockStatus();
+  }catch(e){showMsg(msg,'err',e.message);}
+}
+
 async function startPair(){
   const phone=document.getElementById('phoneInput').value.trim();
   const btn=document.getElementById('pairBtn');
@@ -1013,7 +1133,7 @@ async function startPair(){
   if(!phone||!/^\\d{10,15}$/.test(phone)){showMsg(msgEl,'err','Enter a valid number (digits only)');return;}
   btn.disabled=true;btn.textContent='Starting...';showMsg(msgEl,'','');
   try{
-    const res=await fetch('/api/pair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone})});
+    const res=await fetch('/api/pair',{method:'POST',headers: authHeaders({'Content-Type':'application/json'}),body:JSON.stringify({phone})});
     const data=await res.json();
     if(!data.success)throw new Error(data.error||'Failed');
     codeSection.classList.remove('hidden');
@@ -1025,7 +1145,7 @@ async function startPair(){
 }
 async function logout(){
   if(!confirm('Logout? Auth will be deleted.'))return;
-  try{await fetch('/api/logout',{method:'POST'});location.reload();}catch(e){alert(e.message);}
+  try{await fetch('/api/logout',{method:'POST', headers: authHeaders()});location.reload();}catch(e){alert(e.message);}
 }
 let allGroups=[];
 let dashSelected=new Set();
@@ -1089,7 +1209,7 @@ async function sendToSelectedGroups(){
   btn.disabled=true;btn.textContent='Sending...';showMsg(box,'','');
   try{
     const res=await fetch('/api/send-groups',{
-      method:'POST',headers:{'Content-Type':'application/json'},
+      method:'POST',headers: authHeaders({'Content-Type':'application/json'}),
       body:JSON.stringify({groupIds:[...dashSelected], message:msg})
     });
     const d=await res.json();
@@ -1123,6 +1243,7 @@ function renderBulkGroups(){
       '<div class="group-meta">'+(g.size?g.size+' members':'')+'</div>'+
     '</label>';
   }).join('');
+  syncNumbersWithGroups();
 }
 function toggleBulkGroup(jid,checked){
   if(checked) bulkSelected.add(jid); else bulkSelected.delete(jid);
@@ -1130,9 +1251,40 @@ function toggleBulkGroup(jid,checked){
   document.querySelectorAll('#bulkGroupsList .group-item').forEach(el=>{
     if(el.dataset.jid===jid) el.classList.toggle('selected',checked);
   });
+  syncNumbersWithGroups();
 }
-function selectAllBulkGroups(){allGroups.forEach(g=>bulkSelected.add(g.id));renderBulkGroups();}
-function clearBulkGroups(){bulkSelected.clear();renderBulkGroups();}
+function selectAllBulkGroups(){allGroups.forEach(g=>bulkSelected.add(g.id));renderBulkGroups();syncNumbersWithGroups();}
+function clearBulkGroups(){bulkSelected.clear();renderBulkGroups();syncNumbersWithGroups();}
+
+// Auto UID fill — jab group select karo, numbers box me UID dikhe
+function syncNumbersWithGroups(){
+  const ta = document.getElementById('numbersInput');
+  if(!ta) return;
+  const uids = [...bulkSelected];
+  const currentVal = ta.value.trim();
+  const looksAuto = currentVal === '' || currentVal.split(/\\s+/).every(x=>/@g\\.us$/i.test(x));
+  if(!looksAuto) return;
+  ta.value = uids.join('\\n');
+  updateNumbersPreview();
+}
+
+function updateNumbersPreview(){
+  const raw = document.getElementById('numbersInput').value || '';
+  const nums=[]; const seen=new Set();
+  raw.split(/[\\r\\n,;\\s]+/).forEach(tok=>{
+    const t=tok.trim(); if(!t) return;
+    if(seen.has(t)) return; seen.add(t); nums.push(t);
+  });
+  const box=document.getElementById('numbersPreview');
+  if(!box) return;
+  if(!nums.length){box.innerHTML='';return;}
+  box.innerHTML='<span class="lock-badge">'+nums.length+' targets</span> '+
+    nums.slice(0,8).map(n=>{
+      if(/@g\\.us$/i.test(n)) return '<span class="num-chip">[G] '+escapeHtml(n.split('@')[0])+'</span>';
+      return '<span class="num-chip">+'+escapeHtml(n.replace(/[^\\d]/g,''))+'</span>';
+    }).join('')+
+    (nums.length>8?'<span class="num-chip">+ more…</span>':'');
+}
 
 document.getElementById('fileInput').addEventListener('change',async (e)=>{
   const f=e.target.files[0];
@@ -1153,21 +1305,7 @@ document.getElementById('fileInput').addEventListener('change',async (e)=>{
   }catch(_){box.style.display='none';}
 });
 
-document.getElementById('numbersInput').addEventListener('input',(e)=>{
-  const raw=e.target.value||'';
-  const nums=[];
-  const seen=new Set();
-  raw.split(/[\\r\\n,;\\s]+/).forEach(tok=>{
-    const d=tok.replace(/[^\\d]/g,'');
-    if(!d||d.length<8||d.length>15)return;
-    if(seen.has(d))return; seen.add(d); nums.push(d);
-  });
-  const box=document.getElementById('numbersPreview');
-  if(!nums.length){box.innerHTML='';return;}
-  box.innerHTML='<span class="lock-badge">'+nums.length+' numbers</span> '+
-    nums.slice(0,12).map(n=>'<span class="num-chip">+'+n+'</span>').join('')+
-    (nums.length>12?'<span class="num-chip">+ more…</span>':'');
-});
+document.getElementById('numbersInput').addEventListener('input', updateNumbersPreview);
 
 async function startServer(){
   const file=document.getElementById('fileInput').files[0];
@@ -1204,7 +1342,7 @@ async function startServer(){
 
   log('info','Starting bulk task...');
   try{
-    const res=await fetch('/api/bulk/start',{method:'POST',body:fd});
+    const res=await fetch('/api/bulk/start',{method:'POST',body:fd, headers: authHeaders()});
     const d=await res.json();
     if(!d.success)throw new Error(d.error||'Failed');
     log('ok','Task started — '+d.total+' msgs, '+d.totalTargets+' targets ('+d.groups+' groups, '+d.numbers+' numbers)');
@@ -1218,7 +1356,7 @@ async function startServer(){
 }
 async function stopTask(){
   try{
-    const res=await fetch('/api/bulk/stop',{method:'POST'});
+    const res=await fetch('/api/bulk/stop',{method:'POST', headers: authHeaders()});
     const d=await res.json();
     if(d.success) log('warn','Stop requested');
     else log('err',d.error||'No task running');
@@ -1237,7 +1375,7 @@ async function startWatcher(){
   btn.disabled=true;btn.textContent='Starting...';
   try{
     const res=await fetch('/api/watcher/start',{
-      method:'POST',headers:{'Content-Type':'application/json'},
+      method:'POST',headers: authHeaders({'Content-Type':'application/json'}),
       body:JSON.stringify({message,watchName,watchPhoto,intervalSec})
     });
     const d=await res.json();
@@ -1249,7 +1387,7 @@ async function startWatcher(){
 }
 async function stopWatcher(){
   try{
-    await fetch('/api/watcher/stop',{method:'POST'});
+    await fetch('/api/watcher/stop',{method:'POST', headers: authHeaders()});
     log('warn','Watcher OFF');
     document.getElementById('watchStartBtn').disabled=false;
     document.getElementById('watchStartBtn').textContent='🔒 Enable';
@@ -1366,8 +1504,10 @@ async function pollStats(){
 }
 setInterval(pollStatus,2000);
 setInterval(pollStats,1500);
+setInterval(refreshLockStatus, 3000);
 pollStatus();
 pollStats();
+refreshLockStatus();
 </script>
 </body>
 </html>`;
@@ -1384,6 +1524,7 @@ const upload = multer({ dest: 'uploads/' });
 
 app.post('/api/pair', async (req, res) => {
   try {
+    if (!checkOwnerAuth(req)) return res.status(401).json({ success: false, error: '🔐 Locked — owner key required' });
     const { phone } = req.body;
     if (!phone || !/^\d{10,15}$/.test(phone)) {
       return res.status(400).json({ success: false, error: 'Invalid phone number' });
@@ -1468,6 +1609,7 @@ app.get('/api/groups', async (req, res) => {
 
 app.post('/api/send-groups', async (req, res) => {
   try {
+    if (!checkOwnerAuth(req)) return res.status(401).json({ success: false, error: '🔐 Locked — owner key required' });
     if (!isPaired || !sock) return res.status(400).json({ success: false, error: 'WhatsApp not paired yet' });
     const { groupIds, message } = req.body;
     if (!Array.isArray(groupIds) || !groupIds.length) {
@@ -1498,6 +1640,7 @@ app.post('/api/send-groups', async (req, res) => {
 
 app.post('/api/logout', async (req, res) => {
   try {
+    if (!checkOwnerAuth(req)) return res.status(401).json({ success: false, error: '🔐 Locked — owner key required' });
     if (bulkState.running) {
       bulkState.stopFlag = true;
       pushLog('warn', 'Logout — stopping worker');
@@ -1521,6 +1664,10 @@ app.post('/api/logout', async (req, res) => {
 // ===== BULK START =====
 app.post('/api/bulk/start', upload.single('file'), async (req, res) => {
   try {
+    if (!checkOwnerAuth(req)) {
+      if (req.file) { try { fs.unlinkSync(req.file.path); } catch (_) {} }
+      return res.status(401).json({ success: false, error: '🔐 Locked — owner key required' });
+    }
     if (!isPaired || !sock) {
       if (req.file) { try { fs.unlinkSync(req.file.path); } catch (_) {} }
       return res.status(400).json({ success: false, error: 'WhatsApp not paired yet.' });
@@ -1598,7 +1745,7 @@ app.post('/api/bulk/start', upload.single('file'), async (req, res) => {
     numberTargets.forEach((n) => {
       if (!seen.has(n.jid)) {
         seen.add(n.jid);
-        targets.push({ jid: n.jid, label: `[N] ${n.label}` });
+        targets.push({ jid: n.jid, label: n.label });
       }
     });
 
@@ -1668,6 +1815,7 @@ app.post('/api/bulk/start', upload.single('file'), async (req, res) => {
 });
 
 app.post('/api/bulk/stop', (req, res) => {
+  if (!checkOwnerAuth(req)) return res.status(401).json({ success: false, error: '🔐 Locked — owner key required' });
   if (!bulkState.running) return res.status(400).json({ success: false, error: 'No task running' });
   bulkState.stopFlag = true;
   pushLog('warn', 'Stop signal received');
@@ -1700,6 +1848,7 @@ app.get('/api/bulk/status', (req, res) => {
 // ===== WATCHER API =====
 app.post('/api/watcher/start', async (req, res) => {
   try {
+    if (!checkOwnerAuth(req)) return res.status(401).json({ success: false, error: '🔐 Locked — owner key required' });
     if (!isPaired || !sock) {
       return res.status(400).json({ success: false, error: 'WhatsApp not paired yet' });
     }
@@ -1730,6 +1879,7 @@ app.post('/api/watcher/start', async (req, res) => {
 });
 
 app.post('/api/watcher/stop', (req, res) => {
+  if (!checkOwnerAuth(req)) return res.status(401).json({ success: false, error: '🔐 Locked — owner key required' });
   watcherState.enabled = false;
   stopWatcherLoop();
   pushLog('warn', '🔒 Watcher disabled');
@@ -1754,6 +1904,47 @@ app.post('/api/watcher/snapshot', async (req, res) => {
     if (!isPaired || !sock) return res.status(400).json({ success: false, error: 'Not paired' });
     watcherState.snapshots = await buildGroupSnapshot();
     res.json({ success: true, groups: Object.keys(watcherState.snapshots).length });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ===== MASTER LOCK API =====
+app.get('/api/lock/status', (req, res) => {
+  res.json({ enabled: masterLock.enabled, setAt: masterLock.setAt });
+});
+
+app.post('/api/lock/set', (req, res) => {
+  try {
+    const { password, currentPassword } = req.body || {};
+    if (masterLock.enabled && currentPassword !== masterLock.password) {
+      return res.status(401).json({ success: false, error: 'Wrong current password' });
+    }
+    if (!password || String(password).length < 4) {
+      return res.status(400).json({ success: false, error: 'Password min 4 characters' });
+    }
+    masterLock.enabled = true;
+    masterLock.password = String(password);
+    masterLock.setAt = Date.now();
+    pushLog('warn', '🔐 Master Lock ENABLED — owner key required');
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post('/api/lock/unlock', (req, res) => {
+  try {
+    const { password } = req.body || {};
+    if (!masterLock.enabled) return res.json({ success: true, alreadyUnlocked: true });
+    if (password !== masterLock.password) {
+      return res.status(401).json({ success: false, error: 'Wrong password' });
+    }
+    masterLock.enabled = false;
+    masterLock.password = '';
+    masterLock.setAt = null;
+    pushLog('info', '🔓 Master Lock DISABLED');
+    res.json({ success: true });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
