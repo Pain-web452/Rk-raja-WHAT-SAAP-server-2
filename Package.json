@@ -1,0 +1,19 @@
+{
+  "name": "9man-yamdhud-whatsapp",
+  "version": "1.0.0",
+  "description": "WhatsApp Bulk Sender + Group Change Watcher",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.0",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "pino": "^9.0.0"
+  }
+}
